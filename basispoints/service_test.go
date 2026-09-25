@@ -94,6 +94,18 @@ func TestEmptyModelListRoutesNothing(t *testing.T) {
 	}
 }
 
+func TestUpstreamErrorDoesNotEchoBody(t *testing.T) {
+	errUpstream := upstreamError(http.StatusForbidden, []byte(`{"error":{"code":"basispoints_model_access_changed","message":"Bearer secret-token"}}`))
+	var statusErr *StatusError
+	if !errorAs(errUpstream, &statusErr) || statusErr.Code != "basispoints_model_access_changed" || strings.Contains(statusErr.Message, "secret-token") {
+		t.Fatalf("model access error = %v", errUpstream)
+	}
+	errOther := upstreamError(422, []byte(`{"error":{"message":"request echoed secret"}}`))
+	if !errorAs(errOther, &statusErr) || strings.Contains(statusErr.Message, "secret") || statusErr.Code != "basispoints_upstream_error" {
+		t.Fatalf("generic error = %v", errOther)
+	}
+}
+
 func TestUpstreamHeaders(t *testing.T) {
 	headers := upstreamHeaders("token-1", "acct-1", "chatgpt")
 	if headers["authorization"][0] != "Bearer token-1" {
@@ -104,6 +116,14 @@ func TestUpstreamHeaders(t *testing.T) {
 	}
 	if headers["x-basispoints-auth-mode"][0] != "chatgpt" {
 		t.Fatalf("auth mode = %v", headers["x-basispoints-auth-mode"])
+	}
+	if headers["x-openai-internal-basispoints-client-product"][0] != "basispoints-excel-plugin" || headers["x-openai-internal-basispoints-client-agent-profile"][0] != "excel" {
+		t.Fatalf("excel profile headers = %#v", headers)
+	}
+	for _, name := range upstreamHeaderProfile {
+		if _, ok := headers[name]; !ok {
+			t.Fatalf("header profile omits %s", name)
+		}
 	}
 }
 

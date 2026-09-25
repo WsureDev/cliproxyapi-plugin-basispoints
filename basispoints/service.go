@@ -449,34 +449,88 @@ func (s *Service) pump(ctx context.Context, host HostClient, streamID string, op
 		_ = host.CloseStream(context.Background(), streamID, "basispoints stream is empty")
 		return
 	}
-	buf := make([]byte, 32*1024)
+	var done <-chan struct{}
+	if ctx != nil {
+		done = ctx.Done()
+	}
+	reads := make(chan readChunk, 1)
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, errRead := reader.Read(buf)
+			chunk := append([]byte(nil), buf[:n]...)
+			select {
+			case reads <- readChunk{chunk: chunk, err: errRead}:
+			case <-done:
+				return
+			}
+			if errRead != nil {
+				return
+			}
+		}
+	}()
 	splitter := sseSplitter{}
+	terminal := false
+	keepalive := time.NewTicker(15 * time.Second)
+	defer keepalive.Stop()
+	emitFrames := func(frames [][]byte) bool {
+		for _, frame := range frames {
+			if sseTerminal(frame) {
+				terminal = true
+			}
+			if errEmit := host.Emit(ctx, streamID, frame); errEmit != nil {
+				_ = host.CloseStream(context.Background(), streamID, errEmit.Error())
+				return false
+			}
+		}
+		return true
+	}
 	for {
-		if ctx != nil && ctx.Err() != nil {
+		select {
+		case <-done:
 			_ = host.CloseStream(context.Background(), streamID, ctx.Err().Error())
 			return
-		}
-		n, errRead := reader.Read(buf)
-		for _, frame := range splitter.push(buf[:n]) {
-			if errEmit := host.Emit(ctx, streamID, frame); errEmit != nil {
+		case <-keepalive.C:
+			if errEmit := host.Emit(ctx, streamID, []byte(": keepalive\n\n")); errEmit != nil {
 				_ = host.CloseStream(context.Background(), streamID, errEmit.Error())
 				return
 			}
-		}
-		if errRead != nil {
-			if errRead != io.EOF && !errors.Is(errRead, io.ErrUnexpectedEOF) {
-				_ = host.CloseStream(context.Background(), streamID, errRead.Error())
+		case res := <-reads:
+			if !emitFrames(splitter.push(res.chunk)) {
 				return
 			}
-			for _, frame := range splitter.flush() {
-				if errEmit := host.Emit(ctx, streamID, frame); errEmit != nil {
-					_ = host.CloseStream(context.Background(), streamID, errEmit.Error())
-					return
-				}
+			if res.err == nil {
+				continue
+			}
+			if !emitFrames(splitter.flush()) {
+				return
+			}
+			if res.err != io.EOF && !errors.Is(res.err, io.ErrUnexpectedEOF) {
+				_ = host.CloseStream(context.Background(), streamID, res.err.Error())
+				return
+			}
+			if !terminal {
+				_ = host.Emit(ctx, streamID, incompleteStreamEvent)
 			}
 			_ = host.CloseStream(ctx, streamID, "")
 			return
 		}
+	}
+}
+
+type readChunk struct {
+	chunk []byte
+	err   error
+}
+
+var incompleteStreamEvent = []byte("data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"basispoints_stream_incomplete\",\"message\":\"Upstream stream ended before completion\"}}}\n\n")
+
+func sseTerminal(frame []byte) bool {
+	switch gjson.GetBytes(sseData(frame), "type").String() {
+	case "response.completed", "response.incomplete", "response.failed", "error":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -513,23 +567,17 @@ func streamFrames(raw []byte) [][]byte {
 }
 
 func upstreamError(status int, body []byte) error {
-	message := strings.TrimSpace(string(body))
-	if len(message) > 65536 {
-		message = message[:65536]
-	}
-	if message == "" {
-		message = "basispoints upstream status " + strconv.Itoa(status)
-	}
-	code := "upstream_error"
-	if value := strings.TrimSpace(gjson.GetBytes(body, "error.code").String()); value != "" {
-		code = value
-	} else if value := strings.TrimSpace(gjson.GetBytes(body, "error.type").String()); value != "" {
-		code = value
-	}
 	if status <= 0 {
 		status = http.StatusBadGateway
 	}
-	return &StatusError{Code: code, Message: message, HTTPStatus: status}
+	code := strings.TrimSpace(gjson.GetBytes(body, "error.code").String())
+	if code == "basispoints_model_access_changed" {
+		return &StatusError{Code: code, Message: "This model is not available on the account's Excel BPS endpoint", HTTPStatus: status}
+	}
+	if code == "" {
+		code = "basispoints_upstream_error"
+	}
+	return &StatusError{Code: code, Message: "Excel BPS rejected this request; the upstream body was not returned", HTTPStatus: status}
 }
 
 func retryAfter(headers map[string][]string, now time.Time) time.Duration {
