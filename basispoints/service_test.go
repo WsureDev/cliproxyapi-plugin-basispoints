@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -45,58 +46,51 @@ func TestRegistrationSatisfiesHostMetadata(t *testing.T) {
 
 func TestRouteMatchesSuffixAndSkipsBlockedModels(t *testing.T) {
 	svc := New()
-	routed := svc.Route("gpt-6-astra(max)")
+	routed := svc.Route("gpt-6-astra(max)", nil)
 	if !routed.Handled || routed.TargetKind != pluginapi.ModelRouteTargetSelf {
 		t.Fatalf("astra route = %#v", routed)
 	}
-	if svc.Route("gpt-5.6-sol").Handled != true {
+	if svc.Route("gpt-5.6-sol", nil).Handled != true {
 		t.Fatal("expected gpt-5.6-sol to route")
 	}
-	if svc.Route("gpt-6-sol").Handled || svc.Route("gpt-6-luna").Handled {
+	if svc.Route("gpt-6-sol", nil).Handled || svc.Route("gpt-6-luna", nil).Handled {
 		t.Fatal("blocked models must stay on the native path")
 	}
 }
 
-func TestPrepareBodyClampsEffort(t *testing.T) {
-	body, errPrepare := prepareBody([]byte(`{"model":"gpt-6-astra(max)","previous_response_id":"resp_old","reasoning":{"effort":"max"}}`), "gpt-6-astra", "max", "high")
-	if errPrepare != nil {
-		t.Fatal(errPrepare)
+func TestRouteAliasExclusionAndNativeFallback(t *testing.T) {
+	svc := New()
+	svc.RememberHost(pluginapi.HostConfigSummary{
+		OAuthModelAlias: map[string][]pluginapi.ModelAlias{
+			"codex": {{Name: "gpt-6-astra", Alias: "astra"}},
+		},
+		ExcludedModels: map[string][]string{"codex": {"gpt-5.6-sol"}},
+	})
+	if !svc.Route("astra", nil).Handled {
+		t.Fatal("alias should route to the configured upstream model")
 	}
-	if got := gjson.GetBytes(body, "model").String(); got != "gpt-6-astra" {
-		t.Fatalf("model = %s", got)
+	if svc.Route("gpt-5.6-sol", nil).Handled {
+		t.Fatal("excluded model must stay on the native path")
 	}
-	if gjson.GetBytes(body, "previous_response_id").Exists() {
-		t.Fatalf("previous_response_id leaked: %s", body)
+	if svc.Route("codex/gpt-6-astra", nil).Handled != true {
+		t.Fatal("provider prefix should resolve to the allowlist")
 	}
-	if got := gjson.GetBytes(body, "reasoning.effort").String(); got != "high" {
-		t.Fatalf("effort = %s", got)
+	body := []byte(`{"tools":[{"type":"image_generation"}]}`)
+	if route := svc.Route("gpt-6-astra", body); route.Handled || route.Reason != "image_generation" {
+		t.Fatalf("image generation route = %#v", route)
 	}
-	if !gjson.GetBytes(body, "stream").Bool() {
-		t.Fatalf("stream = %s", body)
-	}
+}
 
-	kept, errKept := prepareBody([]byte(`{"reasoning":{"effort":"medium"}}`), "gpt-5.6-sol", "", "high")
-	if errKept != nil {
-		t.Fatal(errKept)
+func TestEmptyModelListRoutesNothing(t *testing.T) {
+	svc := New()
+	if errConfigure := svc.Configure([]byte("models: []\n")); errConfigure != nil {
+		t.Fatal(errConfigure)
 	}
-	if got := gjson.GetBytes(kept, "reasoning.effort").String(); got != "medium" {
-		t.Fatalf("medium effort = %s", got)
+	if svc.Route("gpt-6-astra", nil).Handled {
+		t.Fatal("empty allowlist must not take over")
 	}
-
-	fromSuffix, errSuffix := prepareBody([]byte(`{}`), "gpt-6-astra", "xhigh", "high")
-	if errSuffix != nil {
-		t.Fatal(errSuffix)
-	}
-	if got := gjson.GetBytes(fromSuffix, "reasoning.effort").String(); got != "high" {
-		t.Fatalf("suffix effort = %s", got)
-	}
-
-	none, errNone := prepareBody([]byte(`{"reasoning":{"effort":"none"}}`), "gpt-6-astra", "none", "high")
-	if errNone != nil {
-		t.Fatal(errNone)
-	}
-	if gjson.GetBytes(none, "reasoning.effort").Exists() {
-		t.Fatalf("none effort remained: %s", none)
+	if len(svc.StaticModels().Models) != 0 {
+		t.Fatal("empty allowlist must not publish models")
 	}
 }
 
@@ -172,7 +166,7 @@ func TestExecuteRotatesAfter429(t *testing.T) {
 		if req.Headers["chatgpt-account-id"][0] == "acct-a" {
 			return UpstreamResponse{StatusCode: http.StatusTooManyRequests, Body: []byte(`{"error":{"code":"rate_limit_exceeded","message":"slow down"}}`), Headers: map[string][]string{"retry-after": {"30"}}}, nil
 		}
-		return UpstreamResponse{StatusCode: http.StatusOK, Body: []byte(`{"type":"response.completed","response":{"id":"resp_ok","output":[]}}`)}, nil
+		return UpstreamResponse{StatusCode: http.StatusOK, Body: []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"output\":[]}}\n\n")}, nil
 	}
 
 	resp, errExecute := svc.Execute(context.Background(), host, pluginapi.ExecutorRequest{
@@ -190,11 +184,11 @@ func TestExecuteRotatesAfter429(t *testing.T) {
 	}
 
 	host.calls = nil
-	if _, errAgain := svc.Execute(context.Background(), host, pluginapi.ExecutorRequest{Model: "gpt-5.6-sol", Payload: []byte(`{}`)}); errAgain != nil {
+	if _, errAgain := svc.Execute(context.Background(), host, pluginapi.ExecutorRequest{Model: "gpt-5.6-sol", Payload: []byte(`{"input":"hi"}`)}); errAgain != nil {
 		t.Fatal(errAgain)
 	}
-	if host.callsFor("acct-a") != 0 || host.callsFor("acct-b") != 1 {
-		t.Fatalf("cooled calls = %#v", host.calls)
+	if host.callsFor("acct-a") != 1 || host.callsFor("acct-b") != 1 {
+		t.Fatalf("retry calls = %#v", host.calls)
 	}
 }
 
@@ -218,9 +212,9 @@ func TestExecuteRetriesUnauthorizedOnce(t *testing.T) {
 		if req.Headers["authorization"][0] == "Bearer stale" {
 			return UpstreamResponse{StatusCode: http.StatusUnauthorized, Body: []byte(`{"error":{"code":"invalid_api_key","message":"expired"}}`)}, nil
 		}
-		return UpstreamResponse{StatusCode: http.StatusOK, Body: []byte(`{"type":"response.completed","response":{"id":"resp_new"}}`)}, nil
+		return UpstreamResponse{StatusCode: http.StatusOK, Body: []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_new\",\"output\":[]}}\n\n")}, nil
 	}
-	resp, errExecute := svc.Execute(context.Background(), host, pluginapi.ExecutorRequest{Model: "gpt-6-astra", Payload: []byte(`{}`)})
+	resp, errExecute := svc.Execute(context.Background(), host, pluginapi.ExecutorRequest{Model: "gpt-6-astra", Payload: []byte(`{"input":"hi"}`)})
 	if errExecute != nil {
 		t.Fatal(errExecute)
 	}
@@ -234,6 +228,9 @@ func TestExecuteRetriesUnauthorizedOnce(t *testing.T) {
 
 func TestExecuteBusyWhenAccountInFlight(t *testing.T) {
 	svc := New()
+	if errConfigure := svc.Configure([]byte("max_in_flight_per_account: 1\n")); errConfigure != nil {
+		t.Fatal(errConfigure)
+	}
 	started := make(chan struct{})
 	release := make(chan struct{})
 	host := &fakeHost{
@@ -247,15 +244,15 @@ func TestExecuteBusyWhenAccountInFlight(t *testing.T) {
 			close(started)
 		}
 		<-release
-		return UpstreamResponse{StatusCode: http.StatusOK, Body: []byte(`{"type":"response.completed","response":{"id":"resp_1"}}`)}, nil
+		return UpstreamResponse{StatusCode: http.StatusOK, Body: []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[]}}\n\n")}, nil
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, errExecute := svc.Execute(context.Background(), host, pluginapi.ExecutorRequest{Model: "gpt-6-astra", Payload: []byte(`{}`)})
+		_, errExecute := svc.Execute(context.Background(), host, pluginapi.ExecutorRequest{Model: "gpt-6-astra", Payload: []byte(`{"input":"hi"}`)})
 		done <- errExecute
 	}()
 	<-started
-	_, errBusy := svc.Execute(context.Background(), host, pluginapi.ExecutorRequest{Model: "gpt-6-astra", Payload: []byte(`{}`)})
+	_, errBusy := svc.Execute(context.Background(), host, pluginapi.ExecutorRequest{Model: "gpt-6-astra", Payload: []byte(`{"input":"hi"}`)})
 	var statusErr *StatusError
 	if errBusy == nil || !errorAs(errBusy, &statusErr) || statusErr.HTTPStatus != http.StatusTooManyRequests || statusErr.Code != "basispoints_busy" {
 		t.Fatalf("busy error = %v", errBusy)
@@ -283,7 +280,7 @@ func TestExecuteStreamEmitsSSE(t *testing.T) {
 	}
 	closed := make(chan struct{})
 	host.onClose = func() { close(closed) }
-	_, errExecute := svc.ExecuteStream(context.Background(), host, pluginapi.ExecutorRequest{Model: "gpt-6-astra", Payload: []byte(`{}`)}, "stream-1")
+	_, errExecute := svc.ExecuteStream(context.Background(), host, pluginapi.ExecutorRequest{Model: "gpt-6-astra", Payload: []byte(`{"input":"hi"}`)}, "stream-1")
 	if errExecute != nil {
 		t.Fatal(errExecute)
 	}
@@ -341,6 +338,54 @@ func TestParseConfigOverrides(t *testing.T) {
 	}
 	if cfg.MinInterval != 250*time.Millisecond || cfg.Cooldown != 5*time.Second {
 		t.Fatalf("timing = %s %s", cfg.MinInterval, cfg.Cooldown)
+	}
+}
+
+func TestExecuteRewritesCodexBody(t *testing.T) {
+	svc := New()
+	if errConfigure := svc.Configure([]byte("max_effort: high\n")); errConfigure != nil {
+		t.Fatal(errConfigure)
+	}
+	var sent []byte
+	host := &fakeHost{
+		auths: []AuthRecord{{AuthIndex: "a", Provider: "codex"}},
+		files: map[string][]byte{"a": []byte(`{"access_token":"token-a","account_id":"acct-a"}`)},
+	}
+	host.do = func(req UpstreamRequest) (UpstreamResponse, error) {
+		sent = append([]byte(nil), req.Body...)
+		return UpstreamResponse{StatusCode: http.StatusOK, Body: []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_wire\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n")}, nil
+	}
+	payload := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"exec","description":"run js"}]}]},{"type":"message","role":"user","id":"msg_1","content":[{"type":"input_text","text":"hi"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t"}}],"tool_choice":"auto","parallel_tool_calls":true,"reasoning":{"effort":"max","context":"all_turns"},"include":["reasoning.encrypted_content"],"text":{"verbosity":"low"},"client_metadata":{"session_id":"s"},"prompt_cache_key":"thread-1","store":false,"stream":true}`)
+	resp, errExecute := svc.Execute(context.Background(), host, pluginapi.ExecutorRequest{
+		Model:   "gpt-5.6-sol",
+		Headers: http.Header{"Thread-Id": []string{"thread-1"}},
+		Payload: payload,
+	})
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	if gjson.GetBytes(resp.Payload, "response.id").String() != "resp_wire" {
+		t.Fatalf("payload = %s", resp.Payload)
+	}
+	if gjson.GetBytes(sent, "model").String() != "gpt-5.6-sol" || gjson.GetBytes(sent, "model_selection").String() != "explicit" {
+		t.Fatalf("model wire = %s", sent)
+	}
+	if gjson.GetBytes(sent, "reasoning_effort").String() != "high" {
+		t.Fatalf("effort = %s", gjson.GetBytes(sent, "reasoning_effort").String())
+	}
+	for _, field := range []string{"reasoning", "include", "text", "client_metadata", "tool_choice", "parallel_tool_calls", "tools"} {
+		if gjson.GetBytes(sent, field).Exists() {
+			t.Fatalf("%s leaked: %s", field, sent)
+		}
+	}
+	if strings.Contains(string(sent), "additional_tools") || strings.Contains(string(sent), "internal_chat_message_metadata_passthrough") {
+		t.Fatalf("codex item leaked: %s", sent)
+	}
+	if !strings.HasPrefix(gjson.GetBytes(sent, "prompt_cache_key").String(), "bps-") {
+		t.Fatalf("cache key = %s", gjson.GetBytes(sent, "prompt_cache_key").String())
+	}
+	if !strings.Contains(gjson.GetBytes(sent, "input.0.content.0.text").String(), "functions.exec") {
+		t.Fatalf("catalog missing: %s", sent)
 	}
 }
 

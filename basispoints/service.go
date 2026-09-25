@@ -3,6 +3,7 @@ package basispoints
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"sort"
@@ -89,13 +90,19 @@ type HostClient interface {
 
 // Service routes selected models through the Basis Points responses API.
 type Service struct {
-	mu        sync.Mutex
-	cfg       Config
-	cursor    int
-	inflight  map[string]int
-	nextAt    map[string]time.Time
-	coolUntil map[string]time.Time
-	now       func() time.Time
+	mu            sync.Mutex
+	cfg           Config
+	cursor        int
+	inflight      map[string]int
+	nextAt        map[string]time.Time
+	coolUntil     map[string]time.Time
+	now           func() time.Time
+	replay        *ReplayCache
+	aliases       map[string]string
+	excluded      map[string]struct{}
+	imageOverride imageUploader
+	imageStore    *expiringImages
+	imageStamp    string
 }
 
 func New() *Service {
@@ -105,6 +112,9 @@ func New() *Service {
 		nextAt:    map[string]time.Time{},
 		coolUntil: map[string]time.Time{},
 		now:       time.Now,
+		replay:    &ReplayCache{},
+		aliases:   map[string]string{},
+		excluded:  map[string]struct{}{},
 	}
 }
 
@@ -143,9 +153,12 @@ func (s *Service) StaticModels() pluginapi.ModelResponse {
 	return pluginapi.ModelResponse{Provider: providerCodex, Models: s.snapshot().modelInfos()}
 }
 
-func (s *Service) Route(model string) pluginapi.ModelRouteResponse {
-	if _, ok := s.snapshot().canonicalModel(model); !ok {
+func (s *Service) Route(model string, body []byte) pluginapi.ModelRouteResponse {
+	if _, ok := s.resolveModel(model); !ok {
 		return pluginapi.ModelRouteResponse{Handled: false}
+	}
+	if reason := NativeFallbackReason(body); reason != "" {
+		return pluginapi.ModelRouteResponse{Handled: false, Reason: reason}
 	}
 	return pluginapi.ModelRouteResponse{
 		Handled:    true,
@@ -213,12 +226,14 @@ func (s *Service) ExecuteStream(ctx context.Context, host HostClient, req plugin
 
 type openedStream struct {
 	stream ByteStream
+	bridge *Bridge
 }
 
 func (s *Service) call(ctx context.Context, host HostClient, req pluginapi.ExecutorRequest) ([]byte, error) {
-	prepared, cfg, errPrepare := s.prepare(req)
-	if errPrepare != nil {
-		return nil, errPrepare
+	cfg := s.snapshot()
+	canonical, ok := s.resolveModel(requestModel(req))
+	if !ok {
+		return nil, &StatusError{Code: "model_not_routed", Message: "model is not routed to basispoints", HTTPStatus: http.StatusNotFound}
 	}
 	skip := map[string]struct{}{}
 	var lastErr error
@@ -229,6 +244,11 @@ func (s *Service) call(ctx context.Context, host HostClient, req pluginapi.Execu
 				return nil, lastErr
 			}
 			return nil, errAcquire
+		}
+		prepared, bridge, errPrepare := s.build(ctx, cfg, req, canonical, account.accountID)
+		if errPrepare != nil {
+			release.release(s, 0, 0)
+			return nil, errPrepare
 		}
 		status, headers, body, errDo := s.roundTrip(ctx, host, cfg, prepared, account)
 		if errDo != nil {
@@ -261,14 +281,19 @@ func (s *Service) call(ctx context.Context, host HostClient, req pluginapi.Execu
 			})
 			return nil, upstreamError(status, body)
 		}
-		return body, nil
+		translated, errTranslate := translateUpstream(bridge, body)
+		if errTranslate != nil {
+			return nil, &StatusError{Code: "basispoints_protocol_error", Message: errTranslate.Error(), HTTPStatus: http.StatusBadGateway}
+		}
+		return translated, nil
 	}
 }
 
 func (s *Service) openStream(ctx context.Context, host HostClient, req pluginapi.ExecutorRequest) (openedStream, *lease, error) {
-	prepared, cfg, errPrepare := s.prepare(req)
-	if errPrepare != nil {
-		return openedStream{}, nil, errPrepare
+	cfg := s.snapshot()
+	canonical, ok := s.resolveModel(requestModel(req))
+	if !ok {
+		return openedStream{}, nil, &StatusError{Code: "model_not_routed", Message: "model is not routed to basispoints", HTTPStatus: http.StatusNotFound}
 	}
 	skip := map[string]struct{}{}
 	var lastErr error
@@ -280,7 +305,13 @@ func (s *Service) openStream(ctx context.Context, host HostClient, req pluginapi
 			}
 			return openedStream{}, nil, errAcquire
 		}
+		prepared, bridge, errPrepare := s.build(ctx, cfg, req, canonical, account.accountID)
+		if errPrepare != nil {
+			release.release(s, 0, 0)
+			return openedStream{}, nil, errPrepare
+		}
 		opened, status, headers, body, errDo := s.roundTripStream(ctx, host, cfg, prepared, account)
+		opened.bridge = bridge
 		if errDo != nil {
 			release.release(s, 0, 0)
 			return openedStream{}, nil, errDo
@@ -291,6 +322,7 @@ func (s *Service) openStream(ctx context.Context, host HostClient, req pluginapi
 				opened.stream = nil
 			}
 			opened, status, headers, body, errDo = s.retryUnauthorizedStream(ctx, host, cfg, prepared, account)
+			opened.bridge = bridge
 			if errDo != nil {
 				release.release(s, 0, 0)
 				return openedStream{}, nil, errDo
@@ -324,28 +356,6 @@ type preparedRequest struct {
 	model string
 	body  []byte
 	url   string
-}
-
-func (s *Service) prepare(req pluginapi.ExecutorRequest) (preparedRequest, Config, error) {
-	cfg := s.snapshot()
-	model := strings.TrimSpace(req.Model)
-	if model == "" {
-		model = strings.TrimSpace(gjson.GetBytes(requestPayload(req), "model").String())
-	}
-	canonical, ok := cfg.canonicalModel(model)
-	if !ok {
-		return preparedRequest{}, cfg, &StatusError{
-			Code:       "model_not_routed",
-			Message:    "model is not routed to basispoints",
-			HTTPStatus: http.StatusNotFound,
-		}
-	}
-	_, suffix, _ := splitModelSuffix(model)
-	body, errPrepare := prepareBody(requestPayload(req), canonical, suffix, cfg.MaxEffort)
-	if errPrepare != nil {
-		return preparedRequest{}, cfg, errPrepare
-	}
-	return preparedRequest{model: canonical, body: body, url: cfg.BaseURL + "/responses"}, cfg, nil
 }
 
 func requestPayload(req pluginapi.ExecutorRequest) []byte {
@@ -422,26 +432,39 @@ func upstreamCall(cfg Config, prepared preparedRequest, creds credential) Upstre
 
 func (s *Service) pump(ctx context.Context, host HostClient, streamID string, opened openedStream, release *lease) {
 	defer release.release(s, http.StatusOK, 0)
+	var reader io.ReadCloser
+	if opened.bridge != nil && opened.stream != nil {
+		reader = opened.bridge.Stream(&byteStreamReader{stream: opened.stream})
+	}
 	defer func() {
+		if reader != nil {
+			_ = reader.Close()
+			return
+		}
 		if opened.stream != nil {
 			_ = opened.stream.Close()
 		}
 	}()
+	if reader == nil {
+		_ = host.CloseStream(context.Background(), streamID, "basispoints stream is empty")
+		return
+	}
+	buf := make([]byte, 32*1024)
 	splitter := sseSplitter{}
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			_ = host.CloseStream(context.Background(), streamID, ctx.Err().Error())
 			return
 		}
-		chunk, errRead := opened.stream.Read()
-		for _, frame := range splitter.push(chunk) {
+		n, errRead := reader.Read(buf)
+		for _, frame := range splitter.push(buf[:n]) {
 			if errEmit := host.Emit(ctx, streamID, frame); errEmit != nil {
 				_ = host.CloseStream(context.Background(), streamID, errEmit.Error())
 				return
 			}
 		}
 		if errRead != nil {
-			if errRead != io.EOF {
+			if errRead != io.EOF && !errors.Is(errRead, io.ErrUnexpectedEOF) {
 				_ = host.CloseStream(context.Background(), streamID, errRead.Error())
 				return
 			}
@@ -560,12 +583,8 @@ func (s *Service) finish(key string, status int, retryAfterWait time.Duration) {
 	if s.cfg.MinInterval > 0 {
 		s.nextAt[key] = now.Add(s.cfg.MinInterval)
 	}
-	if status == http.StatusTooManyRequests {
-		wait := retryAfterWait
-		if wait <= 0 {
-			wait = s.cfg.Cooldown
-		}
-		s.coolUntil[key] = now.Add(wait)
+	if status == http.StatusTooManyRequests && s.cfg.Cooldown > 0 {
+		s.coolUntil[key] = now.Add(s.cfg.Cooldown)
 	}
 }
 
@@ -644,7 +663,7 @@ func (s *Service) pick(records []AuthRecord, cfg Config, skip, excluded map[stri
 			cooling++
 			continue
 		}
-		if s.inflight[index] >= cfg.MaxInFlight {
+		if cfg.MaxInFlight > 0 && s.inflight[index] >= cfg.MaxInFlight {
 			busy++
 			continue
 		}

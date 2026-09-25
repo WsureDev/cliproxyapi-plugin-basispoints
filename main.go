@@ -152,7 +152,26 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(service.Registration())
 	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
 		return okEnvelope(map[string]any{})
-	case pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth:
+	case pluginabi.MethodModelStatic:
+		var req pluginapi.StaticModelRequest
+		if len(request) > 0 {
+			if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+				return nil, errUnmarshal
+			}
+		}
+		service.RememberHost(req.Host)
+		return okEnvelope(service.StaticModels())
+	case pluginabi.MethodModelForAuth:
+		var req struct {
+			pluginapi.AuthModelRequest
+			HostCallbackID string `json:"host_callback_id,omitempty"`
+		}
+		if len(request) > 0 {
+			if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+				return nil, errUnmarshal
+			}
+		}
+		service.RememberHost(req.Host)
 		return okEnvelope(service.StaticModels())
 	case pluginabi.MethodModelRoute:
 		var req routeCall
@@ -161,7 +180,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				return nil, errUnmarshal
 			}
 		}
-		return okEnvelope(service.Route(req.RequestedModel))
+		return okEnvelope(service.Route(req.RequestedModel, req.Body))
 	case pluginabi.MethodExecutorIdentifier:
 		return okEnvelope(map[string]string{"identifier": "codex"})
 	case pluginabi.MethodExecutorExecute:

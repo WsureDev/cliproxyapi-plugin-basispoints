@@ -12,13 +12,12 @@ import (
 
 const (
 	pluginName          = "basispoints"
-	pluginVersion       = "0.1.0"
+	pluginVersion       = "0.3.0"
 	defaultBaseURL      = "https://bps.openai.com/basispoints/api"
 	defaultAuthMode     = "chatgpt"
 	defaultAuthProvider = "codex"
-	defaultMaxEffort    = "high"
-	defaultMaxInFlight  = 1
-	defaultCooldown     = 30 * time.Second
+	defaultMaxEffort    = "xhigh"
+	defaultImageTTL     = 30 * time.Minute
 	providerCodex       = "codex"
 	formatCodex         = "codex"
 )
@@ -45,17 +44,33 @@ type Config struct {
 	MaxInFlight  int
 	MinInterval  time.Duration
 	Cooldown     time.Duration
+	ImageUpload  bool
+	ImageTTL     time.Duration
+	S3Endpoint   string
+	S3Region     string
+	S3Bucket     string
+	S3AccessKey  string
+	S3SecretKey  string
+	S3Prefix     string
 }
 
 type rawConfig struct {
-	BaseURL      string   `yaml:"base_url"`
-	AuthMode     string   `yaml:"auth_mode"`
-	AuthProvider string   `yaml:"auth_provider"`
-	Models       []string `yaml:"models"`
-	MaxEffort    string   `yaml:"max_effort"`
-	MaxInFlight  int      `yaml:"max_in_flight_per_account"`
-	MinInterval  int      `yaml:"min_interval_ms"`
-	Cooldown     int      `yaml:"cooldown_ms"`
+	BaseURL         string    `yaml:"base_url"`
+	AuthMode        string    `yaml:"auth_mode"`
+	AuthProvider    string    `yaml:"auth_provider"`
+	Models          *[]string `yaml:"models"`
+	MaxEffort       string    `yaml:"max_effort"`
+	MaxInFlight     int       `yaml:"max_in_flight_per_account"`
+	MinInterval     int       `yaml:"min_interval_ms"`
+	Cooldown        int       `yaml:"cooldown_ms"`
+	ImageUpload     bool      `yaml:"image_upload"`
+	ImageTTLSeconds int       `yaml:"image_ttl_seconds"`
+	S3Endpoint      string    `yaml:"image_s3_endpoint"`
+	S3Region        string    `yaml:"image_s3_region"`
+	S3Bucket        string    `yaml:"image_s3_bucket"`
+	S3AccessKey     string    `yaml:"image_s3_access_key_id"`
+	S3SecretKey     string    `yaml:"image_s3_secret_access_key"`
+	S3Prefix        string    `yaml:"image_s3_prefix"`
 }
 
 type registration struct {
@@ -94,6 +109,13 @@ func normalize(raw rawConfig) Config {
 		AuthProvider: strings.ToLower(strings.TrimSpace(raw.AuthProvider)),
 		MaxEffort:    strings.ToLower(strings.TrimSpace(raw.MaxEffort)),
 		MaxInFlight:  raw.MaxInFlight,
+		ImageUpload:  raw.ImageUpload,
+		S3Endpoint:   strings.TrimRight(strings.TrimSpace(raw.S3Endpoint), "/"),
+		S3Region:     strings.TrimSpace(raw.S3Region),
+		S3Bucket:     strings.TrimSpace(raw.S3Bucket),
+		S3AccessKey:  strings.TrimSpace(raw.S3AccessKey),
+		S3SecretKey:  strings.TrimSpace(raw.S3SecretKey),
+		S3Prefix:     strings.Trim(strings.TrimSpace(raw.S3Prefix), "/"),
 		Models:       map[string]string{},
 	}
 	if cfg.BaseURL == "" {
@@ -108,20 +130,33 @@ func normalize(raw rawConfig) Config {
 	if _, ok := effortRank[cfg.MaxEffort]; !ok {
 		cfg.MaxEffort = defaultMaxEffort
 	}
-	if cfg.MaxInFlight <= 0 {
-		cfg.MaxInFlight = defaultMaxInFlight
+	if cfg.MaxInFlight < 0 {
+		cfg.MaxInFlight = 0
 	}
 	if raw.MinInterval > 0 {
 		cfg.MinInterval = time.Duration(raw.MinInterval) * time.Millisecond
 	}
 	if raw.Cooldown > 0 {
 		cfg.Cooldown = time.Duration(raw.Cooldown) * time.Millisecond
-	} else {
-		cfg.Cooldown = defaultCooldown
 	}
-	models := raw.Models
-	if len(models) == 0 {
-		models = defaultModels
+	cfg.ImageTTL = defaultImageTTL
+	if raw.ImageTTLSeconds > 0 {
+		cfg.ImageTTL = time.Duration(raw.ImageTTLSeconds) * time.Second
+	}
+	if cfg.S3Region == "" {
+		cfg.S3Region = "auto"
+	}
+	if cfg.S3Prefix == "" {
+		cfg.S3Prefix = "bps"
+	}
+	if cfg.S3Endpoint != "" && !strings.Contains(cfg.S3Endpoint, "://") {
+		cfg.S3Endpoint = "https://" + cfg.S3Endpoint
+	}
+	var models []string
+	if raw.Models == nil {
+		models = append([]string(nil), defaultModels...)
+	} else {
+		models = *raw.Models
 	}
 	for _, model := range models {
 		model = strings.TrimSpace(model)
@@ -159,7 +194,7 @@ func (c Config) modelInfos() []pluginapi.ModelInfo {
 			Name:        name,
 			Description: "Basis Points responses model",
 			Thinking: &pluginapi.ThinkingSupport{
-				Levels: []string{"minimal", "low", "medium", "high"},
+				Levels: []string{"minimal", "low", "medium", "high", "xhigh"},
 			},
 			SupportedGenerationMethods: []string{"responses", "chat"},
 			UserDefined:                true,
@@ -180,11 +215,19 @@ func pluginRegistration() registration {
 				{Name: "base_url", Type: pluginapi.ConfigFieldTypeString, Description: "Basis Points API origin. The plugin appends /responses."},
 				{Name: "auth_mode", Type: pluginapi.ConfigFieldTypeString, Description: "Value of x-basispoints-auth-mode. Defaults to chatgpt."},
 				{Name: "auth_provider", Type: pluginapi.ConfigFieldTypeString, Description: "Host credential provider to read tokens from. Defaults to codex."},
-				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Model ids routed to Basis Points. Defaults to gpt-6-astra and gpt-5.6-sol."},
-				{Name: "max_effort", Type: pluginapi.ConfigFieldTypeString, Description: "Highest reasoning.effort sent upstream. max and xhigh clamp down to this value. Defaults to high."},
-				{Name: "max_in_flight_per_account", Type: pluginapi.ConfigFieldTypeInteger, Description: "Simultaneous upstream requests per Codex account. Defaults to 1."},
-				{Name: "min_interval_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Minimum gap between requests on the same account. Defaults to 0."},
-				{Name: "cooldown_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Local cooldown after HTTP 429 when Retry-After is absent. Defaults to 30000."},
+				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Exact model ids routed to Basis Points after alias, prefix, and effort-suffix removal. Defaults to gpt-6-astra and gpt-5.6-sol when omitted. An empty list routes nothing."},
+				{Name: "max_effort", Type: pluginapi.ConfigFieldTypeString, Description: "Highest reasoning_effort sent upstream. max and ultra normalize to xhigh, then clamp to this value. Defaults to xhigh."},
+				{Name: "max_in_flight_per_account", Type: pluginapi.ConfigFieldTypeInteger, Description: "Optional cap on simultaneous upstream requests per Codex account. 0 disables the local cap. Defaults to 0."},
+				{Name: "min_interval_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Optional minimum gap between requests on the same account. Defaults to 0."},
+				{Name: "cooldown_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Optional local cooldown after an upstream HTTP 429. Defaults to 0, which does not block later requests."},
+				{Name: "image_upload", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Upload inline data: images to S3 and send an HTTPS URL to Basis Points. Defaults to false. Disabled requests that contain inline images are rejected."},
+				{Name: "image_ttl_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "How long an uploaded image remains readable and stored. Defaults to 1800 seconds. The object is deleted after this time."},
+				{Name: "image_s3_endpoint", Type: pluginapi.ConfigFieldTypeString, Description: "S3-compatible endpoint, such as https://<accountid>.r2.cloudflarestorage.com."},
+				{Name: "image_s3_region", Type: pluginapi.ConfigFieldTypeString, Description: "S3 region. Use auto for Cloudflare R2."},
+				{Name: "image_s3_bucket", Type: pluginapi.ConfigFieldTypeString, Description: "Private bucket that stores temporary images."},
+				{Name: "image_s3_access_key_id", Type: pluginapi.ConfigFieldTypeString, Description: "S3 access key ID."},
+				{Name: "image_s3_secret_access_key", Type: pluginapi.ConfigFieldTypeString, Description: "S3 secret access key."},
+				{Name: "image_s3_prefix", Type: pluginapi.ConfigFieldTypeString, Description: "Object key prefix. Defaults to bps."},
 			},
 		},
 		Capabilities: registrationCapability{
@@ -196,6 +239,14 @@ func pluginRegistration() registration {
 			ExecutorOutputFormats: []string{formatCodex},
 		},
 	}
+}
+
+func (c Config) s3Configured() bool {
+	return c.S3Endpoint != "" && c.S3Bucket != "" && c.S3AccessKey != "" && c.S3SecretKey != ""
+}
+
+func (c Config) imageStamp() string {
+	return strings.Join([]string{c.S3Endpoint, c.S3Region, c.S3Bucket, c.S3AccessKey, c.S3SecretKey, c.S3Prefix, c.ImageTTL.String()}, "\x00")
 }
 
 func splitModelSuffix(model string) (string, string, bool) {
