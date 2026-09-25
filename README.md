@@ -1,6 +1,6 @@
 # cliproxyapi-plugin-basispoints
 
-把 `gpt-6-astra` 和 `gpt-5.6-sol` 转到 Basis Points。客户端仍按原来的 Codex 方式请求，凭据用 CLIProxyAPI 里已有的 Codex 账号。
+把 `gpt-6-astra` 和 `gpt-5.6-sol` 转到 Basis Points。客户端仍按原来的 Codex 方式请求，凭据用 CLIProxyAPI 里已有的 Codex 账号。配置在管理界面里完成，不要手改 YAML。
 
 ## 编译
 
@@ -33,46 +33,43 @@ docker restart cli-proxy-api
 plugin registered plugin_id=basispoints plugin_name=basispoints version=0.3.0
 ```
 
-## 使用
+## 在管理界面里启用
 
-在 `config.yaml` 里打开插件。下面这些值不写也会生效，写出来是为了在管理界面里看得到。
+浏览器打开 CLIProxyAPI 管理面板，用管理密钥登录。
 
-```yaml
-plugins:
-  enabled: true
-  dir: plugins
-  configs:
-    basispoints:
-      enabled: true
-      priority: 100
-      base_url: https://bps.openai.com/basispoints/api
-      auth_mode: chatgpt
-      auth_provider: codex
-      models:
-        - gpt-6-astra
-        - gpt-5.6-sol
-      max_effort: xhigh
-```
+1. 左侧进入 **插件** → **插件管理**。
+2. 确认页面上的全局状态是 **已启用**。如果是 **已停用**，插件实例即使打开也不会生效。
+3. 在列表里找到 `basispoints`，点 **编辑配置**。
+4. 在 **基础设置** 里打开 **启用**。优先级保持 `100` 即可。
+5. 在 **配置字段** 里确认这些值，然后点 **保存**：
 
-重启后再请求这两个模型，就会走 Basis Points。模型名后面的 `(max)` 之类后缀会先去掉再匹配。`models` 写成空列表时，这个插件不接管任何请求。
+| 字段 | 填写 |
+|---|---|
+| `base_url` | `https://bps.openai.com/basispoints/api` |
+| `auth_mode` | `chatgpt` |
+| `auth_provider` | `codex` |
+| `models` | `gpt-6-astra`、`gpt-5.6-sol`，用添加数组项逐个写入 |
+| `max_effort` | `xhigh` |
+| `max_in_flight_per_account` | `0` |
+| `cooldown_ms` | `0` |
 
-`max_in_flight_per_account` 和 `cooldown_ms` 保持 `0`。不要设成 `1`，否则一个长请求没结束时，后续重试会一直收到本地 429。
+保存成功时页面提示 **插件配置已保存**。之后请求这两个模型就会走 Basis Points。
 
-## 图片
+`models` 留空表示不接管任何请求。`max_in_flight_per_account` 不要填 `1`，否则一个长请求没结束时，后续重试会一直收到本地 429。
 
-默认不转发 base64 图片，这种请求会被拒绝。HTTPS 图片地址原样通过。
+## 图片转发
 
-要转发时，用 R2 的 S3 密钥，并保持桶是私有的：
+默认关闭。需要转发 base64 图片时，仍在同一页的 **配置字段** 里填写，不要改配置文件：
 
-```yaml
-image_upload: true
-image_ttl_seconds: 1800
-image_s3_endpoint: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
-image_s3_region: auto
-image_s3_bucket: image
-image_s3_access_key_id: <32 位 Access Key ID>
-image_s3_secret_access_key: <64 位 Secret Access Key>
-image_s3_prefix: bps
-```
+| 字段 | 填写 |
+|---|---|
+| `image_upload` | 打开 |
+| `image_ttl_seconds` | `1800` |
+| `image_s3_endpoint` | `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` |
+| `image_s3_region` | `auto` |
+| `image_s3_bucket` | 桶名，例如 `image`。不要填整段网址 |
+| `image_s3_access_key_id` | R2 令牌页上的 32 位 Access Key ID |
+| `image_s3_secret_access_key` | 对应的 64 位 Secret |
+| `image_s3_prefix` | `bps` |
 
-`image_s3_bucket` 只填桶名。Access Key ID 是 R2 令牌页上的 32 位 ID，不是以 `cfut_` 开头的用户 API Token。图片保留 30 分钟，到期后删除。给 `bps/` 加一条一天后删除的生命周期规则，避免进程重启留下残留文件。
+填完点 **保存**。以 `cfut_` 开头的 Cloudflare 用户 API Token 不能当作 Access Key ID。图片保留 30 分钟后删除。给桶里的 `bps/` 前缀加一条一天后删除的生命周期规则，避免进程重启留下残留文件。
