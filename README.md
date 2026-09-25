@@ -1,37 +1,41 @@
 # cliproxyapi-plugin-basispoints
 
-CLIProxyAPI 插件。把名单里的 Codex 模型转到 Excel / Basis Points（`https://bps.openai.com/basispoints/api/responses`），使用宿主机里已有的 Codex OAuth 凭据。
+把 `gpt-6-astra` 和 `gpt-5.6-sol` 转到 Basis Points。客户端仍按原来的 Codex 方式请求，凭据用 CLIProxyAPI 里已有的 Codex 账号。
 
-协议转换来自 sub2api 的 Basis Points 适配。出处见 [basispoints/NOTICE.md](basispoints/NOTICE.md)。
+## 编译
 
-## 行为
-
-- 只转发配置名单中的模型。名单按别名、`codex/` 前缀和 `(max)` 这类 effort 后缀解开后再做精确匹配。省略 `models` 时默认是 `gpt-6-astra` 和 `gpt-5.6-sol`。显式空列表不接管任何模型。
-- 请求体会重写成 BPS 白名单：保留原模型名，附带 `model_selection: explicit`、`reasoning_effort`、工具目录和改写后的 `prompt_cache_key`。Codex 的 `additional_tools`、`client_metadata`、`include`、`reasoning.context` 不会原样上传。
-- `max` / `ultra` 先归一成 `xhigh`，再按 `max_effort` 封顶。`none` / `minimal` 变成 `low`。
-- 客户端工具通过一次 `run_officejs` 传递。响应里的原生工具调用会还原成原来的 function / custom 工具。回放缓存在当前进程内，按账号和线程隔离。
-- `image_generation`，以及带外部访问的 `web_search`，留在原来的 Codex 通道。
-- `previous_response_id` 会拒绝。BPS 需要客户端带上完整历史。
-
-## 编译和安装
-
-在与 CLIProxyAPI 容器相同的 glibc 上编译。官方镜像是 Debian 12：
+用 Debian 12 的 Go 镜像编译，和 `eceasy/cli-proxy-api` 的 glibc 一致。在本机直接编出来的 `.so` 放进容器会加载失败。
 
 ```bash
-go build -buildmode=c-shared -o basispoints.so .
+docker run --rm \
+  -v "$PWD":/src \
+  -w /src \
+  -e CGO_ENABLED=1 \
+  -e PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  golang:1.26-bookworm \
+  go build -buildvcs=false -buildmode=c-shared -o basispoints.so .
 ```
 
-把产物放到插件目录：
+产物是当前目录的 `basispoints.so`。
+
+## 安装
+
+复制到 CLIProxyAPI 的插件目录后重启。
+
+```bash
+install -D -m 644 basispoints.so plugins/linux/amd64/basispoints.so
+docker restart cli-proxy-api
+```
+
+容器内路径是 `/CLIProxyAPI/plugins/linux/amd64/basispoints.so`。启动日志里应有：
 
 ```text
-plugins/linux/amd64/basispoints.so
+plugin registered plugin_id=basispoints plugin_name=basispoints version=0.3.0
 ```
 
-容器内路径是 `/CLIProxyAPI/plugins/linux/amd64/basispoints.so`。替换文件后重启 CLIProxyAPI，日志里应出现 `plugin registered ... version=0.3.0`。
+## 使用
 
-## 配置
-
-写在 `plugins.configs.basispoints` 下。缺省时插件会使用下表中的默认值；管理界面只显示写进配置文件的字段。
+在 `config.yaml` 里打开插件。下面这些值不写也会生效，写出来是为了在管理界面里看得到。
 
 ```yaml
 plugins:
@@ -48,28 +52,17 @@ plugins:
         - gpt-6-astra
         - gpt-5.6-sol
       max_effort: xhigh
-      max_in_flight_per_account: 0
-      min_interval_ms: 0
-      cooldown_ms: 0
-      image_upload: false
-      image_ttl_seconds: 1800
-      image_s3_endpoint: ""
-      image_s3_region: auto
-      image_s3_bucket: ""
-      image_s3_access_key_id: ""
-      image_s3_secret_access_key: ""
-      image_s3_prefix: bps
 ```
 
-`max_in_flight_per_account` 和 `cooldown_ms` 默认是 0。本地不再因为单账号并发或冷却直接回 429。上游返回的 429 会原样交给客户端。
+重启后再请求这两个模型，就会走 Basis Points。模型名后面的 `(max)` 之类后缀会先去掉再匹配。`models` 写成空列表时，这个插件不接管任何请求。
+
+`max_in_flight_per_account` 和 `cooldown_ms` 保持 `0`。不要设成 `1`，否则一个长请求没结束时，后续重试会一直收到本地 429。
 
 ## 图片
 
-`image_upload: false` 时，`data:image/...;base64` 会被拒绝。已经是 HTTPS 的图片地址原样转发。
+默认不转发 base64 图片，这种请求会被拒绝。HTTPS 图片地址原样通过。
 
-打开后，PNG、JPEG、GIF、WebP 会上传到私有 S3 桶。Basis Points 收到的是一张在 `image_ttl_seconds` 内有效的签名链接，默认 30 分钟。到期后插件删除对象。同一个进程里、同一张图在到期前会复用链接。
-
-R2 示例：
+要转发时，用 R2 的 S3 密钥，并保持桶是私有的：
 
 ```yaml
 image_upload: true
@@ -82,8 +75,4 @@ image_s3_secret_access_key: <64 位 Secret Access Key>
 image_s3_prefix: bps
 ```
 
-`image_s3_bucket` 只填桶名。`image_s3_access_key_id` 是 R2 的 S3 Access Key ID，固定 32 位。以 `cfut_` 开头的 Cloudflare 用户 API Token 不能填在这里，R2 会返回 `Credential access key has length 53, should be 32`。
-
-插件进程重启后，内存里尚未执行的删除任务会丢失。给 `bps/` 前缀加一条一天后删除的生命周期规则，可以清掉这些残留对象。
-
-开关打开但 S3 字段没填全时，带图片的请求返回 `basispoints_image_unconfigured`，不会把 base64 原样送往上游。
+`image_s3_bucket` 只填桶名。Access Key ID 是 R2 令牌页上的 32 位 ID，不是以 `cfut_` 开头的用户 API Token。图片保留 30 分钟，到期后删除。给 `bps/` 加一条一天后删除的生命周期规则，避免进程重启留下残留文件。
