@@ -1,10 +1,56 @@
 # cliproxyapi-plugin-basispoints
 
-把 `gpt-6-astra` 和 `gpt-5.6-sol` 转到 Basis Points。客户端仍按原来的 Codex 方式请求，凭据用 CLIProxyAPI 里已有的 Codex 账号。配置在管理界面里完成，不要手改 YAML。
+把 `gpt-6-astra` 和 `gpt-5.6-sol` 转到 Basis Points。客户端仍按原来的 Codex 方式请求，凭据用 CLIProxyAPI 里已有的 Codex 账号。
+
+## 第一次用 Docker Compose
+
+插件文件在容器里的 `/CLIProxyAPI/plugins`。这个目录、配置、账号和日志都要挂到宿主机，否则容器重建后插件和配置会丢。
+
+目录：
+
+```text
+.
+├── docker-compose.yml
+└── cpa/
+    ├── config.yaml
+    ├── auths/
+    ├── logs/
+    └── plugins/
+        └── linux/amd64/basispoints.so
+```
+
+`docker-compose.yml` 里给 `cli-proxy-api` 加上这四条挂载：
+
+```yaml
+services:
+  cli-proxy-api:
+    image: eceasy/cli-proxy-api:latest
+    container_name: cli-proxy-api
+    restart: unless-stopped
+    ports:
+      - "8317:8317"
+      - "1455:1455"
+    volumes:
+      - ./cpa/config.yaml:/CLIProxyAPI/config.yaml
+      - ./cpa/auths:/root/.cli-proxy-api
+      - ./cpa/logs:/CLIProxyAPI/logs
+      - ./cpa/plugins:/CLIProxyAPI/plugins
+```
+
+`./cpa/auths` 对应容器内的 `/root/.cli-proxy-api`，Codex 登录文件放这里。`config.yaml` 里的插件目录保持相对路径：
+
+```yaml
+auth-dir: /root/.cli-proxy-api
+plugins:
+  enabled: true
+  dir: plugins
+```
 
 ## 编译
 
 用 Debian 12 的 Go 镜像编译，和 `eceasy/cli-proxy-api` 的 glibc 一致。在本机直接编出来的 `.so` 放进容器会加载失败。
+
+在本仓库根目录执行：
 
 ```bash
 docker run --rm \
@@ -20,56 +66,89 @@ docker run --rm \
 
 ## 安装
 
-复制到 CLIProxyAPI 的插件目录后重启。
+把 `.so` 放到挂载目录里的平台子目录，然后重启。Linux amd64 是：
 
 ```bash
-install -D -m 644 basispoints.so plugins/linux/amd64/basispoints.so
+install -D -m 644 basispoints.so /path/to/compose/cpa/plugins/linux/amd64/basispoints.so
 docker restart cli-proxy-api
 ```
 
-容器内路径是 `/CLIProxyAPI/plugins/linux/amd64/basispoints.so`。启动日志里应有：
+容器内的实际路径是 `/CLIProxyAPI/plugins/linux/amd64/basispoints.so`。启动日志里应有：
 
 ```text
 plugin registered plugin_id=basispoints plugin_name=basispoints version=0.3.0
 ```
 
-## 在管理界面里启用
+## YAML 配置
 
-浏览器打开 CLIProxyAPI 管理面板，用管理密钥登录。
+写在 `config.yaml` 的 `plugins.configs.basispoints` 下。改完保存，重启容器，或在管理界面里重新加载。管理界面的 **插件 → 插件管理 → basispoints → 编辑配置** 改的是同一份字段。
 
-1. 左侧进入 **插件** → **插件管理**。
-2. 确认页面上的全局状态是 **已启用**。如果是 **已停用**，插件实例即使打开也不会生效。
-3. 在列表里找到 `basispoints`，点 **编辑配置**。
-4. 在 **基础设置** 里打开 **启用**。优先级保持 `100` 即可。
-5. 在 **配置字段** 里确认这些值，然后点 **保存**：
+```yaml
+plugins:
+  enabled: true
+  dir: plugins
+  configs:
+    basispoints:
+      enabled: true
+      priority: 100
+      base_url: https://bps.openai.com/basispoints/api
+      auth_mode: chatgpt
+      auth_provider: codex
+      models:
+        - gpt-6-astra
+        - gpt-5.6-sol
+      max_effort: xhigh
+      max_in_flight_per_account: 0
+      min_interval_ms: 0
+      cooldown_ms: 0
+      image_upload: false
+      image_ttl_seconds: 1800
+      image_s3_endpoint: ""
+      image_s3_region: auto
+      image_s3_bucket: ""
+      image_s3_access_key_id: ""
+      image_s3_secret_access_key: ""
+      image_s3_prefix: bps
+```
 
-| 字段 | 填写 |
+| 字段 | 作用 |
 |---|---|
-| `base_url` | `https://bps.openai.com/basispoints/api` |
-| `auth_mode` | `chatgpt` |
-| `auth_provider` | `codex` |
-| `models` | `gpt-6-astra`、`gpt-5.6-sol`，用添加数组项逐个写入 |
-| `max_effort` | `xhigh` |
-| `max_in_flight_per_account` | `0` |
-| `cooldown_ms` | `0` |
-
-保存成功时页面提示 **插件配置已保存**。之后请求这两个模型就会走 Basis Points。
-
-`models` 留空表示不接管任何请求。`max_in_flight_per_account` 不要填 `1`，否则一个长请求没结束时，后续重试会一直收到本地 429。
-
-## 图片转发
-
-默认关闭。需要转发 base64 图片时，仍在同一页的 **配置字段** 里填写，不要改配置文件：
-
-| 字段 | 填写 |
-|---|---|
-| `image_upload` | 打开 |
-| `image_ttl_seconds` | `1800` |
-| `image_s3_endpoint` | `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` |
-| `image_s3_region` | `auto` |
-| `image_s3_bucket` | 桶名，例如 `image`。不要填整段网址 |
-| `image_s3_access_key_id` | R2 令牌页上的 32 位 Access Key ID |
+| `enabled` | 这个插件是否接管请求。`plugins.enabled` 也必须是 `true` |
+| `priority` | 多个插件同时匹配时的优先级，默认 `100` |
+| `base_url` | Basis Points 地址，末尾不要加 `/responses` |
+| `auth_mode` | 固定 `chatgpt`，使用 Codex OAuth |
+| `auth_provider` | 从哪种账号里取令牌，固定 `codex` |
+| `models` | 要转发的模型。省略时默认就是上面两个。写成 `[]` 则一个都不转发 |
+| `max_effort` | 上游推理强度上限。`max` / `ultra` 会先变成 `xhigh`，再被这个值封顶 |
+| `max_in_flight_per_account` | 每个账号同时打上游的请求数。保持 `0`，表示不在本地限流 |
+| `min_interval_ms` | 同一账号两次请求的最小间隔。保持 `0` |
+| `cooldown_ms` | 上游 429 之后本地冷却多久。保持 `0`，否则重试会一直收到本地 429 |
+| `image_upload` | 是否把 base64 图片上传到 S3。关闭时这类请求直接拒绝 |
+| `image_ttl_seconds` | 图片保留时间，默认 1800 秒 |
+| `image_s3_endpoint` | S3 地址，例如 `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` |
+| `image_s3_region` | R2 填 `auto` |
+| `image_s3_bucket` | 桶名。只写名字，不要写整段网址 |
+| `image_s3_access_key_id` | R2 的 32 位 Access Key ID |
 | `image_s3_secret_access_key` | 对应的 64 位 Secret |
-| `image_s3_prefix` | `bps` |
+| `image_s3_prefix` | 对象前缀，默认 `bps` |
 
-填完点 **保存**。以 `cfut_` 开头的 Cloudflare 用户 API Token 不能当作 Access Key ID。图片保留 30 分钟后删除。给桶里的 `bps/` 前缀加一条一天后删除的生命周期规则，避免进程重启留下残留文件。
+模型名后面的 `(max)` 之类后缀会先去掉再和 `models` 比较。
+
+## 打开图片转发
+
+把上面的图片相关字段改成实际的 S3 信息，例如 Cloudflare R2：
+
+```yaml
+image_upload: true
+image_ttl_seconds: 1800
+image_s3_endpoint: https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+image_s3_region: auto
+image_s3_bucket: image
+image_s3_access_key_id: <32 位 Access Key ID>
+image_s3_secret_access_key: <64 位 Secret Access Key>
+image_s3_prefix: bps
+```
+
+Access Key ID 是 R2 令牌页上的 32 位 ID。以 `cfut_` 开头的 Cloudflare 用户 API Token 不能填在这里。桶保持私有。图片到期后由插件删除。给 `bps/` 再加一条一天后删除的生命周期规则，避免进程重启留下残留文件。
+
+开关打开但地址、桶或密钥没填全时，带 base64 图片的请求会失败，不会把图片原文送到上游。
