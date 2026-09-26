@@ -42,6 +42,7 @@ func (s *Service) RememberHost(host pluginapi.HostConfigSummary) {
 	s.mu.Lock()
 	s.aliases = aliases
 	s.excluded = excluded
+	s.proxyURL = strings.TrimSpace(host.ProxyURL)
 	s.mu.Unlock()
 }
 

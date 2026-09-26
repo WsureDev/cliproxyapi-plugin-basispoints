@@ -222,7 +222,10 @@ func (s *Service) rewriteImages(ctx context.Context, cfg Config, payload []byte)
 				}
 				url, errUpload := uploader.Upload(ctx, contentType, body, cfg.ImageTTL)
 				if errUpload != nil {
-					return nil, &StatusError{Code: "basispoints_image_upload", Message: "basispoints image upload failed", HTTPStatus: http.StatusBadGateway}
+					return nil, &imageUploadFailure{
+						status: &StatusError{Code: "basispoints_image_upload", Message: "basispoints image upload failed", HTTPStatus: http.StatusBadGateway},
+						cause:  errUpload,
+					}
 				}
 				part["image_url"] = url
 				count++
@@ -246,9 +249,9 @@ func (s *Service) uploader(cfg Config) (imageUploader, error) {
 	if !cfg.s3Configured() {
 		return nil, nil
 	}
-	stamp := cfg.imageStamp()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	stamp := cfg.imageStamp() + "\x00" + s.proxyURL
 	if s.imageStore != nil && s.imageStamp == stamp {
 		return s.imageStore, nil
 	}
@@ -256,13 +259,44 @@ func (s *Service) uploader(cfg Config) (imageUploader, error) {
 		s.imageStore.Close()
 		s.imageStore = nil
 	}
-	store, errStore := newS3BlobStore(cfg)
+	store, errStore := newS3BlobStore(cfg, s.proxyURL)
 	if errStore != nil {
 		return nil, errStore
 	}
 	s.imageStore = newExpiringImages(store)
 	s.imageStamp = stamp
 	return s.imageStore, nil
+}
+
+type imageUploadFailure struct {
+	status *StatusError
+	cause  error
+}
+
+func (e *imageUploadFailure) Error() string {
+	if e == nil || e.status == nil {
+		return "basispoints image upload failed"
+	}
+	return e.status.Error()
+}
+
+func (e *imageUploadFailure) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func (e *imageUploadFailure) As(target any) bool {
+	if e == nil || e.status == nil {
+		return false
+	}
+	out, ok := target.(**StatusError)
+	if !ok {
+		return false
+	}
+	*out = e.status
+	return true
 }
 
 func imageStatus(message string) *StatusError {

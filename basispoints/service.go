@@ -18,6 +18,10 @@ import (
 )
 
 // StatusError is returned to the host with an HTTP status.
+type plainError struct{ message string }
+
+func (e *plainError) Error() string { return e.message }
+
 type StatusError struct {
 	Code       string
 	Message    string
@@ -100,6 +104,7 @@ type Service struct {
 	replay        *ReplayCache
 	aliases       map[string]string
 	excluded      map[string]struct{}
+	proxyURL      string
 	imageOverride imageUploader
 	imageStore    *expiringImages
 	imageStamp    string
@@ -248,6 +253,7 @@ func (s *Service) call(ctx context.Context, host HostClient, req pluginapi.Execu
 		prepared, bridge, errPrepare := s.build(ctx, cfg, req, canonical, account.accountID)
 		if errPrepare != nil {
 			release.release(s, 0, 0)
+			logPrepareFailure(host, errPrepare)
 			return nil, errPrepare
 		}
 		status, headers, body, errDo := s.roundTrip(ctx, host, cfg, prepared, account)
@@ -274,7 +280,7 @@ func (s *Service) call(ctx context.Context, host HostClient, req pluginapi.Execu
 		}
 		release.release(s, status, 0)
 		if status < 200 || status >= 300 {
-			logHost(host, "warn", "basispoints upstream rejected request", map[string]string{
+			logHost(host, "warn", "basispoints upstream rejected request: "+upstreamErrorDetail(body), map[string]string{
 				"auth_index": account.authIndex,
 				"model":      prepared.model,
 				"status":     strconv.Itoa(status),
@@ -308,6 +314,7 @@ func (s *Service) openStream(ctx context.Context, host HostClient, req pluginapi
 		prepared, bridge, errPrepare := s.build(ctx, cfg, req, canonical, account.accountID)
 		if errPrepare != nil {
 			release.release(s, 0, 0)
+			logPrepareFailure(host, errPrepare)
 			return openedStream{}, nil, errPrepare
 		}
 		opened, status, headers, body, errDo := s.roundTripStream(ctx, host, cfg, prepared, account)
@@ -566,6 +573,22 @@ func streamFrames(raw []byte) [][]byte {
 	return [][]byte{formatSSEData(event)}
 }
 
+func upstreamErrorDetail(body []byte) string {
+	code := strings.TrimSpace(gjson.GetBytes(body, "error.code").String())
+	message := strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
+	if message == "" {
+		message = strings.TrimSpace(string(body))
+	}
+	message = redactS3Error(&plainError{message})
+	if len(message) > 240 {
+		message = message[:240]
+	}
+	if code == "" {
+		return message
+	}
+	return code + ": " + message
+}
+
 func upstreamError(status int, body []byte) error {
 	if status <= 0 {
 		status = http.StatusBadGateway
@@ -595,6 +618,18 @@ func retryAfter(headers map[string][]string, now time.Time) time.Duration {
 		}
 	}
 	return 0
+}
+
+func logPrepareFailure(host HostClient, err error) {
+	detail := ""
+	var failure *imageUploadFailure
+	if errors.As(err, &failure) && failure != nil {
+		detail = redactS3Error(failure.cause)
+	}
+	if detail == "" && err != nil {
+		detail = err.Error()
+	}
+	logHost(host, "warn", "basispoints prepare failed", map[string]string{"error": detail})
 }
 
 func logHost(host HostClient, level, message string, fields map[string]string) {

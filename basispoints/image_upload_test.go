@@ -80,6 +80,16 @@ func TestImageUploadRequiresStorage(t *testing.T) {
 	}
 }
 
+func TestImageProxyClientAcceptsSOCKS(t *testing.T) {
+	client, errClient := httpClientForProxy("socks5://127.0.0.1:1")
+	if errClient != nil || client == nil || client.Transport == nil {
+		t.Fatalf("proxy client = %v %v", client, errClient)
+	}
+	if _, errDirect := httpClientForProxy(""); errDirect != nil {
+		t.Fatal(errDirect)
+	}
+}
+
 func TestUploadedImageIsDeletedAfterTTL(t *testing.T) {
 	blobs := &memoryBlobs{}
 	images := newExpiringImages(blobs)

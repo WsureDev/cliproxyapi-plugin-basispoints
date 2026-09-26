@@ -151,4 +151,6 @@ image_s3_prefix: bps
 
 Access Key ID 是 R2 令牌页上的 32 位 ID。以 `cfut_` 开头的 Cloudflare 用户 API Token 不能填在这里。桶保持私有。图片到期后由插件删除。给 `bps/` 再加一条一天后删除的生命周期规则，避免进程重启留下残留文件。
 
+S3 上传走 CLIProxyAPI 的 `proxy-url`。容器里经常解析不了 `r2.cloudflarestorage.com`，不走这个代理时上传会失败。
+
 开关打开但地址、桶或密钥没填全时，带 base64 图片的请求会失败，不会把图片原文送到上游。
